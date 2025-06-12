@@ -108,6 +108,7 @@ class DeployTransformerSchema(schema.Transformer):
     requirement: schema.Capability = field(default_factory=schema.Capability)
     resource_group_name: str = ""
     deploy: bool = True
+    source_address_prefixes: Optional[List[str]] = None
 
 
 @dataclass_json
@@ -378,6 +379,10 @@ class DeployTransformer(Transformer):
     def _internal_run(self) -> Dict[str, Any]:
         platform = _load_platform(self._runbook_builder, self.type_name())
         runbook: DeployTransformerSchema = self.runbook
+
+        # Set source_address_prefixes on platform if provided
+        if runbook.source_address_prefixes is not None:
+            platform._azure_runbook.source_address_prefixes = runbook.source_address_prefixes
 
         # Set resource_group_name in platform._azure_runbook to ensure it is used
         if runbook.resource_group_name:
