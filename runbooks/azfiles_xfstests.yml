@@ -49,7 +49,7 @@ variable:
     is_case_visible: true
     value: ""
   - name: smb_testcases
-    is_case_visible: true
+    is_case_visible: false
     value: ""
   - name: source_address_prefixes
     value: ["4.194.0.0/16"]
