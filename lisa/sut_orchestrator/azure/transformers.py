@@ -379,6 +379,10 @@ class DeployTransformer(Transformer):
         platform = _load_platform(self._runbook_builder, self.type_name())
         runbook: DeployTransformerSchema = self.runbook
 
+        # Set resource_group_name in platform._azure_runbook to ensure it is used
+        if runbook.resource_group_name:
+            platform._azure_runbook.resource_group_name = runbook.resource_group_name
+
         envs = Environments()
         environment_requirement = EnvironmentSpace()
         environment_requirement.nodes.append(runbook.requirement)
