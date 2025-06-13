@@ -89,6 +89,13 @@ class B4PatchModifierSchema(BaseModifierSchema):
 
 @dataclass_json()
 @dataclass
+class SourceInstallerOutputSchema:
+    package_types: Optional[List[str]] = field(default=None)
+    dest_path: Optional[str] = field(default=None)
+
+
+@dataclass_json()
+@dataclass
 class SourceInstallerSchema(BaseInstallerSchema):
     location: Optional[BaseLocationSchema] = field(
         default=None, metadata=field_metadata(required=True)
@@ -104,6 +111,8 @@ class SourceInstallerSchema(BaseInstallerSchema):
             required=False,
         ),
     )
+    skip_install: bool = False
+    output: Optional[SourceInstallerOutputSchema] = None
 
 
 class SourceInstaller(BaseInstaller):
@@ -198,6 +207,12 @@ class SourceInstaller(BaseInstaller):
             f"failed on get kernel release: {result.stdout}",
         )
         build_kernel_release = result.stdout
+
+        # If skip_install is set, do not install the kernel
+        if runbook.skip_install:
+            self._log.info("skip_install is set to True. Skipping kernel installation on VM.")
+            return build_kernel_release
+
         self._install_build(
             node=node,
             code_path=self._code_path,
@@ -217,6 +232,38 @@ class SourceInstaller(BaseInstaller):
     def _install_build(
         self, node: Node, code_path: PurePath, build_kernel_release: str
     ) -> None:
+        # If a destination path and package_types are specified, try to install from built packages
+        runbook: SourceInstallerSchema = self.runbook
+        if self._dest_path and runbook.output and runbook.output.package_types:
+            for pkg_type in runbook.output.package_types:
+                if pkg_type == "rpm" and node.os.package_extension == ".rpm":
+                    # Find matching RPMs for this kernel release
+                    rpm_pattern = f"kernel-*{build_kernel_release}*.rpm"
+                    result = node.execute(
+                        f"find {self._dest_path} -maxdepth 1 -name '{rpm_pattern}'",
+                        shell=True,
+                        sudo=True,
+                    )
+                    result.assert_exit_code()
+                    rpm_files = [line for line in result.stdout.splitlines() if line.strip()]
+                    if rpm_files:
+                        self._log.info(f"Installing built RPMs: {rpm_files}")
+                        node.os.install_packages(rpm_files)
+                        return
+                elif pkg_type == "deb" and node.os.package_extension == ".deb":
+                    deb_pattern = f"linux-image-*{build_kernel_release}*.deb"
+                    result = node.execute(
+                        f"find {self._dest_path} -maxdepth 1 -name '{deb_pattern}'",
+                        shell=True,
+                        sudo=True,
+                    )
+                    result.assert_exit_code()
+                    deb_files = [line for line in result.stdout.splitlines() if line.strip()]
+                    if deb_files:
+                        self._log.info(f"Installing built DEBs: {deb_files}")
+                        node.os.install_packages(deb_files)
+                        return
+        # ...existing code for normal install if no suitable package found...
         make = node.tools[Make]
         make.make(arguments="modules", cwd=code_path, sudo=True)
 
@@ -294,6 +341,18 @@ class SourceInstaller(BaseInstaller):
         kernel_version: VersionInfo,
     ) -> None:
         self._log.info("building code...")
+        runbook: SourceInstallerSchema = self.runbook
+             
+        # Determine package_types and dest_path from output if provided
+        build_packages = False
+        package_types = None
+        self._dest_path = None
+        if runbook.output:
+            if runbook.output.package_types is not None:
+                package_types = runbook.output.package_types
+                build_packages = True
+            if runbook.output.dest_path is not None:
+                self._dest_path = node.get_pure_path(runbook.output.dest_path)
 
         uname = node.tools[Uname]
         kernel_information = uname.get_linux_information()
@@ -373,8 +432,34 @@ class SourceInstaller(BaseInstaller):
         make = node.tools[Make]
         make.make(arguments="olddefconfig", cwd=code_path)
 
+        # If build_packages is True, build the requested package types
         # set timeout to 2 hours
-        make.make(arguments="", cwd=code_path, timeout=60 * 60 * 2)
+        if build_packages:
+            if not package_types:
+                package_types = ["rpm", "deb"]  # default to both if not specified
+            for pkg_type in package_types:
+                self._log.info(f"Building kernel package type: {pkg_type}")
+                if pkg_type == "rpm":
+                    make.make(arguments=f"binrpm-pkg", cwd=code_path, timeout=60 * 60 * 2)
+                elif pkg_type == "deb":
+                    make.make(arguments=f"bindeb-pkg", cwd=code_path, timeout=60 * 60 * 2)
+                else:
+                    self._log.warning(f"Unknown package type: {pkg_type}, skipping.")
+            # After building, move/copy artifacts to self._dest_path if specified
+            if self._dest_path:
+                self._log.info(f"Copying build artifacts to destination: {self._dest_path}")
+                # Find and move/copy .rpm and .deb files
+                for ext in ["*.rpm", "*.deb"]:
+                    result = node.execute(
+                        f"find {code_path.parent} -maxdepth 1 -name '{ext}' -exec mv {{}} {self._dest_path}/ \;",
+                        shell=True,
+                        sudo=True,
+                    )
+                    result.assert_exit_code()
+        else:
+            # If build_packages is False, just build the kernel
+            self._log.info("Building kernel without packaging")
+            make.make(arguments="", cwd=code_path, timeout=60 * 60 * 2)
 
     def _fix_mirrorlist_to_vault(self, node: Node) -> None:
         node.execute(
@@ -425,6 +510,8 @@ class SourceInstaller(BaseInstaller):
                     "bc",
                     "ccache",
                     "zstd",
+                    "debhelper-compat",
+                    "libdw-dev",
                 ]
             )
         elif isinstance(os, CBLMariner):
