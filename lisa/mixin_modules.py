@@ -82,3 +82,4 @@ import lisa.transformers.script_file_transformer  # noqa: F401
 import lisa.transformers.script_transformer  # noqa: F401
 import lisa.transformers.to_list  # noqa: F401
 import lisa.transformers.upgrade_packages  # noqa: F401
+from lisa.transformers.kernel_source_packager import KernelSourcePackager
