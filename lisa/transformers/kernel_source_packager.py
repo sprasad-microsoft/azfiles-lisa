@@ -1,35 +1,64 @@
+from lisa import schema
+from lisa.transformer import Transformer
 from lisa.transformers.kernel_source_installer import SourceInstaller, SourceInstallerSchema
 import json
 from datetime import datetime
-from typing import Dict, Any, Optional, List
-from pathlib import PurePosixPath
-import os
+from typing import Dict, Any, Optional, List, Type, cast
 from dataclasses import dataclass, field
 from dataclasses_json import dataclass_json
+import os
+from pathlib import PurePosixPath
+from lisa.transformers.kernel_source_installer import BaseLocationSchema
 
-class KernelSourcePackagerSchema(SourceInstallerSchema):
-    use_cache: bool = field(default=True)
-    # ... other fields ...
+from lisa.transformers.deployment_transformer import (
+    DeploymentTransformer,
+    DeploymentTransformerSchema,
+)
+@dataclass_json()
+@dataclass
+class KernelSourcePackagerSchema(DeploymentTransformerSchema):
+    use_cache: bool = field(default=False)
+    location: Optional[BaseLocationSchema] = field(
+        default=None, metadata={"required": True}
+    )
+    
 
-class KernelSourcePackager(SourceInstaller):
+class KernelSourcePackager(DeploymentTransformer):
     @classmethod
     def type_name(cls) -> str:
         return "kernel_source_packager"
 
     @classmethod
-    def type_schema(cls):
+    def type_schema(cls) -> Type[schema.TypedSchema]:
         return KernelSourcePackagerSchema
+    
+    @property
+    def _output_names(self) -> List[str]:
+        return ["package_path"]
+
     
     def _get_location_factory(self):
         from lisa.util import subclasses
         from lisa.transformers.kernel_source_installer import BaseLocation
         return subclasses.Factory[BaseLocation](BaseLocation)
     
-    def install(self) -> str:
+    def _internal_run(self) -> Dict[str, Any]:
         runbook: KernelSourcePackagerSchema = self.runbook
         self._log.info(f"use_cache value: {runbook.use_cache} (type: {type(runbook.use_cache)})")
+
+        # Use SourceInstaller logic for build steps
+        source_installer_runbook = SourceInstallerSchema(
+            location=runbook.location,
+        )
+        source_installer = SourceInstaller(
+            runbook=source_installer_runbook,
+            node=self._node,
+            parent_log=self._log,
+        )
+
             # 1. Clone and checkout the source to get the actual commit_id and kernel_version
         factory = self._get_location_factory()
+        
         source = factory.create_by_runbook(
             runbook=runbook.location, node=self._node, parent_log=self._log
         )
@@ -47,14 +76,17 @@ class KernelSourcePackager(SourceInstaller):
             self._log.info("Checking for cached kernel packages...")
             if self._check_cache(commit_id, kernel_version):
                 self._log.info("Cache hit: using cached package.")
-                return self._update_cache(commit_id=commit_id)
+                package_path = self._update_cache(commit_id=commit_id)
+                return {"package_path" : package_path}
                 
             else:
                 self._log.info("Cache miss: building and packaging kernel.")
-                return self._build_and_package(commit_id, kernel_version)
+                package_path = self._build_and_package(source_installer, commit_id, kernel_version)
+                return {"package_path" : package_path}
         else:
             self._log.info("No-cache mode: building and packaging kernel.")
-            return self._build_and_package(commit_id, kernel_version)
+            package_path = self._build_and_package(source_installer, commit_id, kernel_version)
+            return {"package_path" : package_path}
 
     def _check_cache(
         self,
@@ -170,7 +202,7 @@ class KernelSourcePackager(SourceInstaller):
 
        
 
-    def _build_and_package(self, commit_id: str, kernel_version: str) -> List[str]:
+    def _build_and_package(self, source_installer, commit_id: str, kernel_version: str) -> str:
         """
         Builds the kernel from source (using already cloned and checked-out code),
         creates a deb package, collects metadata, moves the package to a commit-id-named folder,
@@ -184,14 +216,14 @@ class KernelSourcePackager(SourceInstaller):
         # ...rest of your build and packaging logic...
 
         # 1. Install required build tools (reuse SourceInstaller)
-        self._install_build_tools(node)
+        source_installer._install_build_tools(node)
 
         # 2. Use the already set self._code_path (repo is already cloned and checked out)
         assert node.shell.exists(self._code_path), f"cannot find code path: {self._code_path}"
         self._log.info(f"kernel code path: {self._code_path}")
 
         # 3. Apply code modifications/patches if any (reuse SourceInstaller)
-        self._modify_code(node=node, code_path=self._code_path)
+        source_installer._modify_code(node=node, code_path=self._code_path)
 
         # 3.5. Branch verification: ensure correct branch is checked out
         expected_branch = getattr(runbook, "ref", None)
@@ -206,7 +238,7 @@ class KernelSourcePackager(SourceInstaller):
 
         # 4. Build the kernel (reuse SourceInstaller, but do NOT install)
         kconfig_file = getattr(runbook, "kernel_config_file", None)
-        self._build_code(
+        source_installer._build_code(
             node=node,
             code_path=self._code_path,
             kconfig_file=kconfig_file,
