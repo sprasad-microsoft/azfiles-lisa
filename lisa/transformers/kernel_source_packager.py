@@ -3,9 +3,12 @@ import json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import PurePosixPath
+import os
+from dataclasses import dataclass, field
+from dataclasses_json import dataclass_json
 
 class KernelSourcePackagerSchema(SourceInstallerSchema):
-    use_cache: bool = False
+    use_cache: bool = field(default=True)
     # ... other fields ...
 
 class KernelSourcePackager(SourceInstaller):
@@ -24,12 +27,13 @@ class KernelSourcePackager(SourceInstaller):
     
     def install(self) -> str:
         runbook: KernelSourcePackagerSchema = self.runbook
-
-        # 1. Clone and checkout the source to get the actual commit_id and kernel_version
+        self._log.info(f"use_cache value: {runbook.use_cache} (type: {type(runbook.use_cache)})")
+            # 1. Clone and checkout the source to get the actual commit_id and kernel_version
         factory = self._get_location_factory()
         source = factory.create_by_runbook(
             runbook=runbook.location, node=self._node, parent_log=self._log
         )
+
         self._code_path = source.get_source_code()
         git = self._node.tools["Git"]
         commit_id = git.get_latest_commit_id(cwd=self._code_path)
@@ -40,10 +44,11 @@ class KernelSourcePackager(SourceInstaller):
         kernel_version = result.stdout.strip()
 
         if runbook.use_cache:
+            self._log.info("Checking for cached kernel packages...")
             if self._check_cache(commit_id, kernel_version):
                 self._log.info("Cache hit: using cached package.")
-                package_path = self._update_cache(commit_id=commit_id)
-                return package_path
+                return self._update_cache(commit_id=commit_id)
+                
             else:
                 self._log.info("Cache miss: building and packaging kernel.")
                 return self._build_and_package(commit_id, kernel_version)
@@ -64,8 +69,8 @@ class KernelSourcePackager(SourceInstaller):
         """
         node = self._node
         try:
-            cache_content = node.shell.cat(cache_json_path)
-            cache = json.loads(cache_content)
+            cache_content = node.execute(f"cat {cache_json_path}", shell=True)
+            cache = json.loads(cache_content.stdout)
         except Exception as e:
             self._log.error(f"Failed to load cache: {e}")
             cache = []
@@ -81,7 +86,10 @@ class KernelSourcePackager(SourceInstaller):
                     return False
                 # Check that at least one .deb file exists
                 for package_path in package_paths:
-                    if node.shell.isfile(package_path) and package_path.endswith(".deb"):
+                    if (
+                        package_path.endswith(".deb")
+                        and node.execute(f"test -f {package_path}", shell=True).exit_code == 0
+                    ):
                         return True
                 return False
         return False
@@ -104,8 +112,8 @@ class KernelSourcePackager(SourceInstaller):
         # Load cache
         try:
             if node.shell.exists(cache_json_path):
-                cache_content = node.shell.cat(cache_json_path)
-                cache: List[Dict[str, Any]] = json.loads(cache_content)
+                cache_content = node.execute(f"cat {cache_json_path}", shell=True)
+                cache: List[Dict[str, Any]] = json.loads(cache_content.stdout)
             else:
                 cache = []
         except Exception as e:
@@ -148,13 +156,21 @@ class KernelSourcePackager(SourceInstaller):
         if updated:
             try:
                 cache_str = json.dumps(cache, indent=2)
-                node.shell.write_to_file(cache_json_path, cache_str)
+                node.execute(f"echo '{cache_str}' | sudo tee {cache_json_path}", shell=True)
             except Exception as e:
                 self._log.error(f"Failed to write cache: {e}")
+        
+        # Find the main kernel image .deb (not headers or dbg)
+        if not package_paths:
+            raise Exception("No package_paths found in cache for the given commit_id.")
+        image_deb = next((p for p in package_paths if "linux-image" in p and "dbg" not in p), None)
+        if not image_deb:
+            raise Exception("No main linux-image .deb found in built packages.")
+        return image_deb
 
-        return package_paths
+       
 
-    def _build_and_package(self, commit_id: str, kernel_version: str) -> str:
+    def _build_and_package(self, commit_id: str, kernel_version: str) -> List[str]:
         """
         Builds the kernel from source (using already cloned and checked-out code),
         creates a deb package, collects metadata, moves the package to a commit-id-named folder,
@@ -162,6 +178,10 @@ class KernelSourcePackager(SourceInstaller):
         """
         node = self._node
         runbook: KernelSourcePackagerSchema = self.runbook
+        parent_dir = str(self._code_path.parent)
+        # Clean all files in parent directory before build
+        node.execute(f"rm -f {parent_dir}/*", shell=True)
+        # ...rest of your build and packaging logic...
 
         # 1. Install required build tools (reuse SourceInstaller)
         self._install_build_tools(node)
@@ -196,26 +216,32 @@ class KernelSourcePackager(SourceInstaller):
 
         # 5. Package the kernel as a DEB package
         make = node.tools["Make"]
-        make.make(arguments="deb-pkg", cwd=self._code_path, sudo=True)
+        make.make(arguments="bindeb-pkg", cwd=self._code_path, timeout=60*60*2)
 
         # 6. Find the generated .deb package(s)
-        parent_dir = str(PurePosixPath(self._code_path).parent)
-        deb_files = [f for f in node.shell.ls(parent_dir) if f.endswith(".deb")]
+        
+        deb_dir = str(self._code_path.parent)
+        result = node.execute(f'ls {deb_dir}/*.deb', shell=True)
+        if result.exit_code != 0:
+            raise Exception(f"Failed to list .deb files in {deb_dir}: {result.stderr}")
+        deb_files = [os.path.basename(line.strip()) for line in result.stdout.splitlines() if line.strip().endswith(".deb")]
         if not deb_files:
             raise Exception("No .deb package was generated in the kernel build process.")
+
 
         # 7. Move the .deb file(s) to the cache/packages/<commit_id> directory
         cache_root = "/default/cache"
         packages_dir = f"{cache_root}/packages"
         commit_dir = f"{packages_dir}/commit_id-{commit_id}"
         if not node.shell.exists(commit_dir):
-            node.shell.mkdir(commit_dir, exist_ok=True)
+            node.execute(f"sudo mkdir -p {commit_dir}", shell=True)
+            node.execute(f"sudo chmod 777 {commit_dir}", shell=True)
 
         package_paths = []
         for deb_file in deb_files:
-            src_path = f"{parent_dir}/{deb_file}"
+            src_path = f"{deb_dir}/{deb_file}"
             dest_path = f"{commit_dir}/{deb_file}"
-            node.shell.mv(src_path, dest_path)
+            node.execute(f"sudo mv {src_path} {dest_path}", shell=True)
             package_paths.append(dest_path)
 
         # 8. Collect metadata for cache
@@ -232,4 +258,10 @@ class KernelSourcePackager(SourceInstaller):
 
         # 9. Update the cache and return the first package path
         self._update_cache(metadata=metadata)
-        return package_paths[0]
+        # Find the main kernel image .deb (not headers or dbg)
+        image_deb = next((p for p in package_paths if "linux-image" in p and "dbg" not in p), None)
+        if not image_deb:
+            raise Exception("No main linux-image .deb found in built packages.")
+        return image_deb
+
+        
