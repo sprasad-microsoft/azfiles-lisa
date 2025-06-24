@@ -21,6 +21,7 @@ class KernelSourcePackagerSchema(DeploymentTransformerSchema):
     location: Optional[BaseLocationSchema] = field(
         default=None, metadata={"required": True}
     )
+    cache_path: Optional[str] = field(default=None)
     
 
 class KernelSourcePackager(DeploymentTransformer):
@@ -31,6 +32,50 @@ class KernelSourcePackager(DeploymentTransformer):
     @classmethod
     def type_schema(cls) -> Type[schema.TypedSchema]:
         return KernelSourcePackagerSchema
+    
+    def _get_cache_path(self) -> str:
+        """
+        Returns the cache directory path. Uses the user-specified cache_path if provided,
+        otherwise defaults to '/default/cache'.
+        Validates that the user-provided path exists and is accessible.
+        """
+        runbook: KernelSourcePackagerSchema = self.runbook
+        if runbook.cache_path:
+            # Validate the user-provided cache path
+            user_path = runbook.cache_path.rstrip('/')
+            node = self._node
+            
+            # Check if the base path exists
+            if not node.shell.exists(user_path):
+                self._log.warning(f"User-provided cache_path '{user_path}' does not exist. Attempting to create it.")
+                try:
+                    node.execute(f"sudo mkdir -p {user_path}", shell=True)
+                    node.execute(f"sudo chmod 777 {user_path}", shell=True)
+                    self._log.info(f"Successfully created cache_path: {user_path}")
+                except Exception as e:
+                    raise Exception(f"Failed to create user-provided cache_path '{user_path}': {e}")
+            
+            # Check if the path is writable
+            test_file = f"{user_path}/.cache_test_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            try:
+                node.execute(f"touch {test_file}", shell=True)
+                node.execute(f"rm -f {test_file}", shell=True)
+            except Exception as e:
+                raise Exception(f"User-provided cache_path '{user_path}' is not writable: {e}")
+            
+            cache_path = f"{user_path}/cache"
+            
+            # Ensure the cache subdirectory exists
+            if not node.shell.exists(cache_path):
+                try:
+                    node.execute(f"sudo mkdir -p {cache_path}", shell=True)
+                    node.execute(f"sudo chmod 777 {cache_path}", shell=True)
+                    self._log.info(f"Created cache directory: {cache_path}")
+                except Exception as e:
+                    raise Exception(f"Failed to create cache directory '{cache_path}': {e}")
+            
+            return cache_path
+        return "/default/cache"
     
     @property
     def _output_names(self) -> List[str]:
@@ -92,13 +137,13 @@ class KernelSourcePackager(DeploymentTransformer):
         self,
         commit_id: str,
         kernel_version: str,
-        cache_json_path: str = "/default/cache/kernel_cache.json"
     ) -> bool:
         """
         Checks the cache JSON for an entry matching the given commit_id and kernel_version.
         If found, verifies that the package_path exists and contains a .deb file.
         Returns True if valid .deb package is present, else False.
         """
+        cache_json_path = f"{self._get_cache_path()}/kernel_cache.json"
         node = self._node
         try:
             cache_content = node.execute(f"cat {cache_json_path}", shell=True)
@@ -128,7 +173,6 @@ class KernelSourcePackager(DeploymentTransformer):
 
     def _update_cache(
         self,
-        cache_json_path: str = "/default/cache/kernel_cache.json",
         metadata: Optional[Dict[str, Any]] = None,
         commit_id: Optional[str] = None,
         max_cache_size: int = 100,
@@ -139,6 +183,7 @@ class KernelSourcePackager(DeploymentTransformer):
         2. If only commit_id is provided, moves the entry to the top and updates last_used_time.
         Returns the package_paths of the updated or created entry, or None if not found.
         """
+        cache_json_path = f"{self._get_cache_path()}/kernel_cache.json"
         node = self._node
         now = datetime.utcnow().isoformat() + "Z"
         # Load cache
@@ -258,11 +303,8 @@ class KernelSourcePackager(DeploymentTransformer):
             raise Exception(f"Failed to list .deb files in {deb_dir}: {result.stderr}")
         deb_files = [os.path.basename(line.strip()) for line in result.stdout.splitlines() if line.strip().endswith(".deb")]
         if not deb_files:
-            raise Exception("No .deb package was generated in the kernel build process.")
-
-
-        # 7. Move the .deb file(s) to the cache/packages/<commit_id> directory
-        cache_root = "/default/cache"
+            raise Exception("No .deb package was generated in the kernel build process.")        # 7. Move the .deb file(s) to the cache/packages/<commit_id> directory
+        cache_root = self._get_cache_path()
         packages_dir = f"{cache_root}/packages"
         commit_dir = f"{packages_dir}/commit_id-{commit_id}"
         if not node.shell.exists(commit_dir):
@@ -296,4 +338,3 @@ class KernelSourcePackager(DeploymentTransformer):
             raise Exception("No main linux-image .deb found in built packages.")
         return image_deb
 
-        
