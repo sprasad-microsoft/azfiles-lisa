@@ -44,7 +44,7 @@ class KernelSourcePackager(DeploymentTransformer):
             # Validate the user-provided cache path
             user_path = runbook.cache_path.rstrip('/')
             node = self._node
-            
+            self._log.info(f"Using user-specified cache_path: {user_path}")
             # Check if the base path exists
             if not node.shell.exists(user_path):
                 self._log.warning(f"User-provided cache_path '{user_path}' does not exist. Attempting to create it.")
@@ -54,7 +54,6 @@ class KernelSourcePackager(DeploymentTransformer):
                     self._log.info(f"Successfully created cache_path: {user_path}")
                 except Exception as e:
                     raise Exception(f"Failed to create user-provided cache_path '{user_path}': {e}")
-            
             # Check if the path is writable
             test_file = f"{user_path}/.cache_test_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
             try:
@@ -62,9 +61,7 @@ class KernelSourcePackager(DeploymentTransformer):
                 node.execute(f"rm -f {test_file}", shell=True)
             except Exception as e:
                 raise Exception(f"User-provided cache_path '{user_path}' is not writable: {e}")
-            
             cache_path = f"{user_path}/cache"
-            
             # Ensure the cache subdirectory exists
             if not node.shell.exists(cache_path):
                 try:
@@ -73,8 +70,8 @@ class KernelSourcePackager(DeploymentTransformer):
                     self._log.info(f"Created cache directory: {cache_path}")
                 except Exception as e:
                     raise Exception(f"Failed to create cache directory '{cache_path}': {e}")
-            
             return cache_path
+        self._log.info("Using default cache path: /default/cache")
         return "/default/cache"
     
     @property

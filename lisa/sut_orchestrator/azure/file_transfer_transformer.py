@@ -5,7 +5,6 @@ import re
 
 from lisa import schema
 from lisa.util import field_metadata, constants, LisaException
-from lisa.transformer import Transformer
 from lisa.node import RemoteNode
 from lisa.parameter_parser.runbook import RunbookBuilder
 
@@ -15,28 +14,28 @@ from .common import (
 )
 from .platform_ import AzurePlatform, AzurePlatformSchema
 from .transformers import _load_platform
+from lisa.transformers.deployment_transformer import (
+    DeploymentTransformer,
+    DeploymentTransformerSchema,
+)
 
 @dataclass_json
 @dataclass
-class FileTransferTransformerSchema(schema.Transformer):
-    mode: str = field(
-        default="upload",
-        metadata=field_metadata(
-            required=True,
-            validate=lambda x: x in ["upload", "download"],
-        ),
+class FileTransferTransformerSchema(DeploymentTransformerSchema):
+    connection: Optional[schema.RemoteNode] = field(
+        default=None, metadata=field_metadata(required=False)
     )
-    shared_resource_group_name: str = "lisa_shared_resource_group"
-    resource_group_name: str = field(default="", metadata=field_metadata(required=True))
-    vm_name: str = ""
-    storage_account_name: str = ""
-    container_name: str = "lisa-file-transfer"
+    mode: str = field(default="upload")
+    shared_resource_group_name: str = field(default="lisa_shared_resource_group")
+    storage_account_name: str = field(default="")
+    container_name: str = field(default="lisa-file-transfer")
     vm_directory: str = field(default="", metadata=field_metadata(required=True))
     blob_directory: str = field(default="", metadata=field_metadata(required=True))
-    file_patterns: Optional[Union[str, List[str]]] = None
-    azcopy_path: str = ""
+    file_patterns: Optional[Union[str, List[str]]] = field(default=None)
+    azcopy_path: str = field(default="")
+    container_sas_token: str = field(default="")  # New field for user-provided container SAS
 
-class FileTransferTransformer(Transformer):
+class FileTransferTransformer(DeploymentTransformer):
     __uploaded_urls = "uploaded_blob_urls"
     __downloaded_paths = "downloaded_vm_paths"
 
@@ -54,15 +53,26 @@ class FileTransferTransformer(Transformer):
 
     def _internal_run(self) -> Dict[str, Any]:
         runbook: FileTransferTransformerSchema = self.runbook
-        platform = _load_platform(self._runbook_builder, self.type_name())
-        environment = self._load_environment(platform, runbook)
-        node = self._get_node(environment, runbook)
+        print("DEBUG: runbook.connection =", getattr(self.runbook, "connection", None))
+        print("DEBUG: build_vm_address =", getattr(self.runbook.connection, "address", None) if self.runbook.connection else None)
+        print("DEBUG: private_key_file =", getattr(self.runbook.connection, "private_key_file", None) if self.runbook.connection else None)
+        # Validate mode
+        if runbook.mode not in ["upload", "download"]:
+            raise LisaException(f"Invalid mode '{runbook.mode}'. Must be 'upload' or 'download'.")
+        
+        # Use the node from the deployment transformer
+        node = self._node
+        if not isinstance(node, RemoteNode):
+            raise LisaException("Target node is not a RemoteNode")
 
         self._validate_names(runbook)
         self._ensure_internet(node)
         self._ensure_required_tools(node)
         self._ensure_sudo(node)
         self._ensure_directory_exists(node, runbook.vm_directory, runbook.mode)
+
+        # Get platform for Azure operations
+        platform = _load_platform(self._runbook_builder, self.type_name())
 
         if runbook.mode == "upload":
             urls = self._upload_files(runbook, platform, node)
@@ -95,26 +105,6 @@ class FileTransferTransformer(Transformer):
         if sudo_check.exit_code != 0:
             raise LisaException("User does not have passwordless sudo rights. AzCopy installation will fail.")
 
-    def _load_environment(self, platform: AzurePlatform, runbook: FileTransferTransformerSchema):
-        from .common import load_environment
-        azure_runbook: AzurePlatformSchema = self.runbook.get_extended_runbook(AzurePlatformSchema)
-        environment = load_environment(
-            platform,
-            runbook.resource_group_name,
-            getattr(azure_runbook, "use_public_address", True),
-            self._log,
-        )
-        return environment
-
-    def _get_node(self, environment, runbook: FileTransferTransformerSchema) -> RemoteNode:
-        if runbook.vm_name:
-            node = next(x for x in environment.nodes.list() if x.name == runbook.vm_name)
-        else:
-            node = next(x for x in environment.nodes.list())
-        if not isinstance(node, RemoteNode):
-            raise LisaException("Target node is not a RemoteNode")
-        return node
-
     def _get_sas_url(self, platform: AzurePlatform, runbook: FileTransferTransformerSchema, writable: bool) -> str:
         from datetime import datetime, timezone
         from urllib.parse import parse_qs, urlparse
@@ -126,6 +116,30 @@ class FileTransferTransformer(Transformer):
             and "*" not in runbook.file_patterns
             and runbook.file_patterns != "*"
         )
+        # If multiple files and user provided container SAS, use it
+        is_multiple_files = (
+            runbook.file_patterns is None or
+            runbook.file_patterns == "*" or
+            isinstance(runbook.file_patterns, list) or
+            "*" in (runbook.file_patterns or "")
+        )
+        if is_multiple_files and getattr(runbook, "container_sas_token", ""):
+            self._log.info("Using user-provided container SAS token from runbook for multi-file operation")
+            container_client = get_or_create_storage_container(
+                credential=platform.credential,
+                cloud=platform.cloud,
+                account_name=account_name,
+                container_name=container_name,
+                platform=platform,
+            )
+            blob_path = runbook.blob_directory.rstrip("/")
+            if blob_path:
+                sas_url = f"{container_client.url}/{blob_path}?{runbook.container_sas_token}"
+            else:
+                sas_url = f"{container_client.url}?{runbook.container_sas_token}"
+            self._log.info(f"[DEBUG] Using user-provided container SAS URL: {self._mask_sas_url(sas_url)}")
+            return sas_url
+        # ...existing single-file logic...
         if is_single_file:
             blob_name = f"{runbook.blob_directory}/{runbook.file_patterns}"
         else:
@@ -290,15 +304,28 @@ class FileTransferTransformer(Transformer):
         return uploaded_urls
 
     def _download_files(self, runbook: FileTransferTransformerSchema, platform: AzurePlatform, node: RemoteNode) -> List[str]:
-            sas_url = self._get_sas_url(platform, runbook, writable=False)
+            sas_url = self._get_sas_url(platform, runbook, writable=True)
             file_patterns = runbook.file_patterns or "*"
             azcopy_path = runbook.azcopy_path or self._ensure_azcopy(node)
             downloaded_paths = []
 
-            if isinstance(file_patterns, list):
+            # For multi-file (wildcard or list), use the SAS URL for the prefix only, insert * before ? for flattening
+            if file_patterns == "*" or (isinstance(file_patterns, list) and len(file_patterns) > 1):
+                if "?" in sas_url:
+                    src = sas_url.replace("?", "/*?")
+                else:
+                    src = f"{sas_url}/*"
+                azcopy_cmd = f"sudo {azcopy_path} copy '{src}' '{runbook.vm_directory}' --recursive"
+                self._log.info(f"Downloading files with: {self._mask_sas_url(azcopy_cmd)}")
+                result = node.execute(azcopy_cmd, shell=True)
+                if result.exit_code != 0:
+                    self._log.error(f"AzCopy download failed: {result.stderr}")
+                    self._log.error(f"AzCopy stdout: {result.stdout}")
+                    raise LisaException(f"AzCopy download failed for pattern '{file_patterns}'.")
+                downloaded_paths.append(runbook.vm_directory)
+            elif isinstance(file_patterns, list):
                 for pattern in file_patterns:
                     src = f"{sas_url}/{pattern}"
-                    # Use sudo for azcopy to ensure write permissions
                     azcopy_cmd = f"sudo {azcopy_path} copy '{src}' '{runbook.vm_directory}' --recursive"
                     self._log.info(f"Downloading files with: {self._mask_sas_url(azcopy_cmd)}")
                     result = node.execute(azcopy_cmd, shell=True)
@@ -308,6 +335,7 @@ class FileTransferTransformer(Transformer):
                         raise LisaException(f"AzCopy download failed for pattern '{pattern}'.")
                     downloaded_paths.append(f"{runbook.vm_directory}/{pattern}")
             else:
+                # Single file
                 src = f"{sas_url}/{file_patterns}"
                 azcopy_cmd = f"sudo {azcopy_path} copy '{src}' '{runbook.vm_directory}' --recursive"
                 self._log.info(f"Downloading files with: {self._mask_sas_url(azcopy_cmd)}")
@@ -317,6 +345,22 @@ class FileTransferTransformer(Transformer):
                     self._log.error(f"AzCopy stdout: {result.stdout}")
                     raise LisaException(f"AzCopy download failed for pattern '{file_patterns}'.")
                 downloaded_paths.append(f"{runbook.vm_directory}/{file_patterns}")
+
+            # Debug: List blobs in the blob directory before attempting download
+            from azure.storage.blob import ContainerClient
+            import os
+            try:
+                # Extract base SAS URL (without file_patterns)
+                base_sas_url = sas_url.split("?")[0] + "?" + sas_url.split("?")[1]
+                self._log.info(f"[DEBUG] Attempting to list blobs in: {base_sas_url}")
+                container_client = ContainerClient.from_container_url(base_sas_url)
+                blob_prefix = runbook.file_patterns if isinstance(file_patterns, str) and file_patterns != "*" else ""
+                blob_list = list(container_client.list_blobs(name_starts_with=blob_prefix))
+                self._log.info(f"[DEBUG] Found {len(blob_list)} blobs in directory '{runbook.blob_directory}' with prefix '{blob_prefix}'")
+                for blob in blob_list:
+                    self._log.info(f"[DEBUG] Blob: {blob.name}")
+            except Exception as ex:
+                self._log.warning(f"[DEBUG] Could not list blobs before download: {ex}")
             return downloaded_paths
     
     def _check_files_exist(self, node: RemoteNode, path: str) -> None:
