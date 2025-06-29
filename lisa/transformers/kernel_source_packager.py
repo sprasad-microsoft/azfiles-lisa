@@ -30,6 +30,9 @@ class KernelSourcePackager(SourceInstaller):
         source = factory.create_by_runbook(
             runbook=runbook.location, node=self._node, parent_log=self._log
         )
+
+        source_installer._install_build_tools(self._node)
+
         self._code_path = source.get_source_code()
         git = self._node.tools["Git"]
         commit_id = git.get_latest_commit_id(cwd=self._code_path)
