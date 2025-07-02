@@ -579,7 +579,7 @@ class Xfstesting(TestSuite):
         and use access key // ntlmv2 for authentication.
         """,
         requirement=simple_requirement(
-            min_core_count=16,
+            min_core_count=4,
             supported_platform_type=[AZURE, HYPERV],
             unsupported_os=[BSD, Windows],
         ),
