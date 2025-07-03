@@ -234,13 +234,14 @@ class KernelSourcePackager(DeploymentTransformer):
             except Exception as e:
                 self._log.error(f"Failed to write cache: {e}")
         
-        # Find the main kernel image .deb (not headers or dbg)
+        # Return the directory containing the deb packages
         if not package_paths:
             raise Exception("No package_paths found in cache for the given commit_id.")
-        image_deb = next((p for p in package_paths if "linux-image" in p and "dbg" not in p), None)
-        if not image_deb:
-            raise Exception("No main linux-image .deb found in built packages.")
-        return image_deb
+        
+        # Extract directory from the first package path
+        first_package_path = package_paths[0]
+        package_dir = os.path.dirname(first_package_path)
+        return package_dir
 
        
 
@@ -327,11 +328,8 @@ class KernelSourcePackager(DeploymentTransformer):
             # "last_used_time" will be set by _update_cache
         }
 
-        # 9. Update the cache and return the first package path
+        # 9. Update the cache and return the directory path
         self._update_cache(metadata=metadata)
-        # Find the main kernel image .deb (not headers or dbg)
-        image_deb = next((p for p in package_paths if "linux-image" in p and "dbg" not in p), None)
-        if not image_deb:
-            raise Exception("No main linux-image .deb found in built packages.")
-        return image_deb
+        # Return the directory containing all the deb packages
+        return commit_dir
 
