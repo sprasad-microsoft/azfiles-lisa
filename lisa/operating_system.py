@@ -19,6 +19,7 @@ from typing import (
     Type,
     Union,
 )
+from urllib.parse import urlparse
 
 from assertpy import assert_that
 from retry import retry
@@ -77,6 +78,7 @@ class CpuArchitecture(str, Enum):
     X64 = "x86_64"
     ARM64 = "aarch64"
     I386 = "i386"
+    UNKNOWN = "unknown"
 
 
 class AzureCoreRepo(str, Enum):
@@ -376,6 +378,9 @@ class Posix(OperatingSystem, BaseClassMixin):
         )
 
         return kernel_information
+
+    def add_repository(self, repo: str, **kwargs: Any) -> None:
+        raise NotImplementedError()
 
     def install_packages(
         self,
@@ -984,6 +989,7 @@ class Debian(Linux):
         no_gpgcheck: bool = True,
         repo_name: Optional[str] = None,
         keys_location: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
         self._initialize_package_installation()
         if keys_location:
@@ -1252,19 +1258,71 @@ class Ubuntu(Debian):
         # --class ubuntu --class gnu-linux --class gnu --class os $menuentry_id_option
         # 'gnulinux-5.11.0-1011-azure-recovery-3fdd2548-1430-450b-b16d-9191404598fb' {
         cat = self._node.tools[Cat]
+        result = cat.run("/boot/grub/grub.cfg", sudo=True)
+        
+        # Try exact match first
         menu_id_pattern = re.compile(
             r"^.*?menuentry '.*?(?:"
-            + kernel_version
+            + re.escape(kernel_version)
             + r"[^ ]*?)(?<! \(recovery mode\))' "
             r".*?\$menuentry_id_option .*?'(?P<menu_id>.*)'.*$",
             re.M,
         )
-        result = cat.run("/boot/grub/grub.cfg", sudo=True)
         submenu_id = get_matched_str(result.stdout, menu_id_pattern)
-        assert submenu_id, (
-            f"cannot find sub menu id from grub config by pattern: "
-            f"{menu_id_pattern.pattern}"
-        )
+        
+        if not submenu_id:
+            # If exact match fails, try fuzzy matching for RC/custom kernels
+            self._log.warning(f"Exact match failed for kernel version '{kernel_version}', trying fuzzy matching")
+            
+            # Extract base version (e.g., "6.16.0" from "6.16.0-rc4")
+            base_version_match = re.match(r'^(\d+\.\d+\.\d+)', kernel_version)
+            if base_version_match:
+                base_version = base_version_match.group(1)
+                self._log.debug(f"Trying fuzzy match with base version: {base_version}")
+                
+                # Look for any menuentry containing the base version
+                fuzzy_pattern = re.compile(
+                    r"^.*?menuentry '.*?(?:"
+                    + re.escape(base_version)
+                    + r"[^ ]*?)(?<! \(recovery mode\))' "
+                    r".*?\$menuentry_id_option .*?'(?P<menu_id>.*)'.*$",
+                    re.M,
+                )
+                submenu_id = get_matched_str(result.stdout, fuzzy_pattern)
+                
+                if submenu_id:
+                    self._log.info(f"Found fuzzy match for kernel with base version {base_version}")
+                else:
+                    # Final fallback: look for the newest kernel entry
+                    self._log.warning("Fuzzy matching failed, looking for newest kernel entry")
+                    newest_pattern = re.compile(
+                        r"^.*?menuentry '.*?Linux (\d+\.\d+\.\d+[^ ]*?)(?<! \(recovery mode\))' "
+                        r".*?\$menuentry_id_option .*?'(?P<menu_id>.*)'.*$",
+                        re.M,
+                    )
+                    all_matches = newest_pattern.findall(result.stdout)
+                    if all_matches:
+                        # Sort by version and pick the newest
+                        newest_kernel = sorted(all_matches, key=lambda x: x[0], reverse=True)[0]
+                        submenu_id = newest_kernel[1]
+                        self._log.info(f"Using newest available kernel: {newest_kernel[0]}")
+        
+        if not submenu_id:
+            self._log.error(f"Cannot find any suitable kernel entry in GRUB config")
+            self._log.debug(f"Original kernel version: {kernel_version}")
+            self._log.debug("Available kernel entries in GRUB:")
+            # Log available entries for debugging
+            entry_pattern = re.compile(
+                r"menuentry '.*?Linux ([^ ]*?)(?<! \(recovery mode\))' ",
+                re.M,
+            )
+            entries = entry_pattern.findall(result.stdout)
+            for entry in entries[:10]:  # Limit to first 10 to avoid log spam
+                self._log.debug(f"  - {entry}")
+            raise AssertionError(
+                f"Cannot find sub menu id from grub config for kernel: {kernel_version}"
+            )
+        
         self._log.debug(f"matched submenu_id: {submenu_id}")
 
         # get first level menu id in boot menu
@@ -1281,7 +1339,21 @@ class Ubuntu(Debian):
         menu_entry = f"{menu_id}>{submenu_id}"
         self._log.debug(f"composited menu_entry: {menu_entry}")
 
+        # Log what we're about to set as default
+        self._log.info(f"Setting GRUB default to: {menu_entry}")
+        
         self._replace_default_entry(menu_entry)
+        
+        # Log the current GRUB environment after setting default
+        try:
+            grub_env_result = self._node.execute("grub-editenv list", sudo=True, no_error_log=True)
+            if grub_env_result.exit_code == 0:
+                self._log.info(f"GRUB environment after setting default: {grub_env_result.stdout}")
+            else:
+                self._log.warning("Could not read GRUB environment")
+        except Exception as e:
+            self._log.debug(f"Could not check GRUB environment: {e}")
+        
         self._node.execute("update-grub", sudo=True)
 
         try:
@@ -1377,6 +1449,8 @@ class Ubuntu(Debian):
 
     def _replace_default_entry(self, entry: str) -> None:
         self._log.debug(f"set boot entry to: {entry}")
+        self._log.info(f"Updating /etc/default/grub with GRUB_DEFAULT='{entry}'")
+        
         sed = self._node.tools[Sed]
         sed.substitute(
             regexp="GRUB_DEFAULT=.*",
@@ -1387,7 +1461,44 @@ class Ubuntu(Debian):
 
         # output to log for troubleshooting
         cat = self._node.tools[Cat]
-        cat.run("/etc/default/grub")
+        result = cat.run("/etc/default/grub")
+        self._log.info(f"Updated /etc/default/grub content:\n{result.stdout}")
+        
+        # Also check if the entry exists in the actual GRUB config
+        grub_cfg_result = cat.run("/boot/grub/grub.cfg", sudo=True, no_error_log=True)
+        if grub_cfg_result.exit_code == 0:
+            # Check if our target entry actually exists in grub.cfg
+            # The entry format is: menu_id>submenu_id, so we need to check both parts
+            entry_parts = entry.split('>')
+            if len(entry_parts) == 2:
+                main_menu_id = entry_parts[0] 
+                submenu_id = entry_parts[1]
+                
+                # Check if both IDs exist in the grub config
+                if main_menu_id in grub_cfg_result.stdout and submenu_id in grub_cfg_result.stdout:
+                    self._log.info(f"Confirmed: both menu parts found in /boot/grub/grub.cfg")
+                    self._log.info(f"  Main menu ID: {main_menu_id}")
+                    self._log.info(f"  Submenu ID: {submenu_id}")
+                else:
+                    self._log.warning(f"Warning: menu entry parts not found in /boot/grub/grub.cfg")
+                    self._log.warning(f"  Main menu ID '{main_menu_id}' found: {main_menu_id in grub_cfg_result.stdout}")
+                    self._log.warning(f"  Submenu ID '{submenu_id}' found: {submenu_id in grub_cfg_result.stdout}")
+            else:
+                # Single entry, not a submenu
+                if entry in grub_cfg_result.stdout:
+                    self._log.info(f"Confirmed: target menu entry '{entry}' found in /boot/grub/grub.cfg")
+                else:
+                    self._log.warning(f"Warning: target menu entry '{entry}' NOT found in /boot/grub/grub.cfg")
+            
+            # Show the actual menu entries for debugging
+            import re
+            menuentry_pattern = re.compile(r"menuentry '([^']*)'.*?(?:\$menuentry_id_option '([^']*)')?", re.M)
+            entries = menuentry_pattern.findall(grub_cfg_result.stdout)
+            self._log.info(f"Available menu entries in GRUB (first 5):")
+            for i, (title, menu_id) in enumerate(entries[:5]):
+                self._log.info(f"  {i}: title='{title}', id='{menu_id}'")
+        else:
+            self._log.warning("Could not read /boot/grub/grub.cfg for verification")
 
     def _initialize_package_installation(self) -> None:
         self.wait_cloud_init_finish()
@@ -1536,6 +1647,7 @@ class RPMDistro(Linux):
         no_gpgcheck: bool = True,
         repo_name: Optional[str] = None,
         keys_location: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
         self._node.tools[YumConfigManager].add_repository(repo, no_gpgcheck)
 
@@ -1954,6 +2066,35 @@ class CBLMariner(RPMDistro):
             sudo=True,
         )
 
+    def add_repository(
+        self,
+        repo: str,
+        no_gpgcheck: bool = True,
+        repo_name: Optional[str] = None,
+        keys_location: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        parsed_url = urlparse(repo)
+        if parsed_url.scheme and parsed_url.netloc:
+            self._node.tools[YumConfigManager].add_repository(repo, no_gpgcheck)
+        else:
+            self._create_local_repo(Path(repo))
+
+    def _create_local_repo(self, source_tarball: Path) -> None:
+        from lisa.tools import CreateRepo, RemoteCopy
+
+        working_path = Path(self._node.get_working_path())
+        tarball_file = source_tarball.name
+        tarball_path = working_path / tarball_file
+
+        # copy tarball to remote node
+        result = self._node.tools[RemoteCopy].copy_to_remote(
+            src=source_tarball, dest=working_path
+        )
+        self._log.debug(f"tarball copied to: {result}")
+
+        self._node.tools[CreateRepo].create_repo_from_tarball(tarball_path)
+
     # Disable KillUserProcesses to avoid test processes being terminated when
     # the SSH session is reset
     def set_kill_user_processes(self) -> None:
@@ -2053,6 +2194,7 @@ class Suse(Linux):
         no_gpgcheck: bool = True,
         repo_name: Optional[str] = None,
         keys_location: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
         self._initialize_package_installation()
         cmd = "zypper ar"
@@ -2186,6 +2328,7 @@ class SlMicro(Suse):
         no_gpgcheck: bool = True,
         repo_name: Optional[str] = None,
         keys_location: Optional[List[str]] = None,
+        **kwargs: Any,
     ) -> None:
         raise SkippedException(
             UnsupportedDistroException(

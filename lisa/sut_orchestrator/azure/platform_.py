@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
+import ast
 import copy
 import json
 import logging
@@ -278,6 +279,7 @@ class AzurePlatformSchema:
     # specify shared resource group location
     shared_resource_group_location: str = field(default=RESOURCE_GROUP_LOCATION)
     resource_group_managed_by: str = field(default="")
+    resource_group_tags: Optional[Dict[str, str]] = field(default=None)
     # specify the locations which used to retrieve marketplace image information
     # example: westus, westus2
     marketplace_image_information_location: Optional[Union[str, List[str]]] = field(
@@ -303,7 +305,7 @@ class AzurePlatformSchema:
     # will be retired. It's recommended to disable outbound access to
     # enforce explicit connectivity rules.
     enable_vm_nat: bool = field(default=False)
-    source_address_prefixes: Optional[List[str]] = field(default=None)
+    source_address_prefixes: Optional[Union[str, List[str]]] = field(default=None)
 
     virtual_network_resource_group: str = field(default="")
     virtual_network_name: str = field(default=AZURE_VIRTUAL_NETWORK_NAME)
@@ -626,6 +628,7 @@ class AzurePlatform(Platform):
                         location=location,
                         log=log,
                         managed_by=self.resource_group_managed_by,
+                        resource_group_tags=self._azure_runbook.resource_group_tags,
                     )
                 else:
                     log.info(f"reusing resource group: [{resource_group_name}]")
@@ -956,6 +959,7 @@ class AzurePlatform(Platform):
             azure_runbook.shared_resource_group_location,
             self._log,
             azure_runbook.resource_group_managed_by,
+            azure_runbook.resource_group_tags,
         )
 
         self._rm_client = get_resource_management_client(
@@ -965,8 +969,30 @@ class AzurePlatform(Platform):
     def _get_ip_addresses(self) -> List[str]:
         if self._cached_ip_address:
             return self._cached_ip_address
-        if self._azure_runbook.source_address_prefixes:
-            self._cached_ip_address = self._azure_runbook.source_address_prefixes
+
+        prefixes = self._azure_runbook.source_address_prefixes
+        result: List[str] = []
+
+        if prefixes:
+            if isinstance(prefixes, str):
+                try:
+                    parsed = ast.literal_eval(prefixes)
+                    if isinstance(parsed, list):
+                        result = parsed
+                    else:
+                        result = prefixes.split(",")
+                except (ValueError, SyntaxError):
+                    result = prefixes.split(",")
+            elif isinstance(prefixes, list):
+                result = prefixes
+            else:
+                raise LisaException(
+                    f"Invalid type for source_address_prefixes: {type(prefixes)}"
+                )
+
+            self._cached_ip_address = [
+                p.strip() for p in result if isinstance(p, str) and p.strip()
+            ]
         else:
             self._cached_ip_address = [get_public_ip()]
         return self._cached_ip_address
@@ -1111,6 +1137,9 @@ class AzurePlatform(Platform):
                     except Exception as e:
                         log.error(f"unknown sku: {sku_obj}")
                         raise e
+            plugin_manager.hook.azure_update_vm_capabilities(
+                location=location, capabilities=all_skus
+            )
             location_data = AzureLocation(location=location, capabilities=all_skus)
             log.debug(f"{location}: saving to disk")
             with open(cached_file_name, "w") as f:
@@ -1153,8 +1182,12 @@ class AzurePlatform(Platform):
         arm_parameters.virtual_network_resource_group = (
             self._azure_runbook.virtual_network_resource_group
         )
-        arm_parameters.subnet_prefix = self._azure_runbook.subnet_prefix
-        arm_parameters.virtual_network_name = self._azure_runbook.virtual_network_name
+        arm_parameters.subnet_prefix = (
+            self._azure_runbook.subnet_prefix or AZURE_SUBNET_PREFIX
+        )
+        arm_parameters.virtual_network_name = (
+            self._azure_runbook.virtual_network_name or AZURE_VIRTUAL_NETWORK_NAME
+        )
         arm_parameters.use_ipv6 = self._azure_runbook.use_ipv6
 
         is_windows: bool = False
