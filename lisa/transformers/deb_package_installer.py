@@ -77,14 +77,16 @@ class DEBPackageInstallerTransformer(PackageInstaller):
                 return {}
             
             # Check if any .deb files are kernel packages
+            dpkg = self._node.tools[Dpkg]
             for deb_file in deb_files:
-                if self._is_kernel_package(deb_file):
+                if dpkg.is_kernel_package(deb_file):
                     kernel_packages_installed.append(deb_file)
                     # Only extract version from bootable kernel images
-                    if self._is_bootable_kernel_package(deb_file):
-                        version = self._extract_kernel_version_from_package(deb_file)
+                    if dpkg.is_bootable_kernel_package(deb_file):
+                        version = dpkg.extract_kernel_version_from_package(deb_file)
                         if version and not installed_kernel_version:
                             installed_kernel_version = version
+                            self._log.info(f"Detected bootable kernel image: {deb_file} (version: {version})")
             
             # Install all .deb files in the directory
             self._log.info(f"Installing all .deb packages in {directory}")
@@ -103,13 +105,15 @@ class DEBPackageInstallerTransformer(PackageInstaller):
                     continue
                 try:
                     # Check if this is a kernel package before installing
-                    if self._is_kernel_package(file):
+                    dpkg = self._node.tools[Dpkg]
+                    if dpkg.is_kernel_package(file):
                         kernel_packages_installed.append(file)
                         # Only extract version from bootable kernel images
-                        if self._is_bootable_kernel_package(file):
-                            version = self._extract_kernel_version_from_package(file)
+                        if dpkg.is_bootable_kernel_package(file):
+                            version = dpkg.extract_kernel_version_from_package(file)
                             if version and not installed_kernel_version:
                                 installed_kernel_version = version
+                                self._log.info(f"Detected bootable kernel image: {file} (version: {version})")
                     
                     self._install_package(full_path)
                     success.append(file)
@@ -246,185 +250,39 @@ class DEBPackageInstallerTransformer(PackageInstaller):
 
         return {}
 
-    def _is_kernel_package(self, package_name: str) -> bool:
-        """
-        Check if a .deb package is a kernel image package.
-        Returns True for packages like linux-image-*.deb
-        """
-        # Remove path and .deb extension to get just the package name
-        base_name = package_name.split('/')[-1]
-        if base_name.endswith('.deb'):
-            base_name = base_name[:-4]
-        
-        # Check for kernel image packages (but not headers, debug, or other kernel packages)
-        kernel_patterns = [
-            r'^linux-image-[0-9]',  # linux-image-6.5.0-rc1+
-            r'^linux-image-.*-azure',  # linux-image-5.15.0-1019-azure
-            r'^linux-image-.*-generic',  # linux-image-5.15.0-generic
-            r'^linux-image-.*-lowlatency',  # linux-image-5.15.0-lowlatency
-            r'^linux-libc-dev',  # linux-libc-dev (userspace kernel headers)
-            r'^linux-modules-[0-9]',  # linux-modules-6.5.0-rc1+
-            r'^linux-modules-.*-azure',  # linux-modules-5.15.0-1019-azure
-            r'^linux-modules-.*-generic',  # linux-modules-5.15.0-generic
-        ]
-        
-        # Exclude non-image packages
-        exclude_patterns = [
-            r'linux-.*-headers',
-            r'linux-.*-tools',
-            r'linux-.*-dbg',
-            r'linux-.*-dev',
-            r'linux-.*-doc',
-        ]
-        
-        # Check exclusions first
-        for pattern in exclude_patterns:
-            if re.match(pattern, base_name, re.IGNORECASE):
-                return False
-        
-        # Check for kernel image patterns
-        for pattern in kernel_patterns:
-            if re.match(pattern, base_name, re.IGNORECASE):
-                self._log.info(f"Detected kernel-related package: {base_name}")
-                return True
-        
-        return False
-
-    def _is_bootable_kernel_package(self, package_name: str) -> bool:
-        """
-        Check if a .deb package is specifically a bootable kernel image.
-        Only these packages should trigger GRUB updates.
-        """
-        # Remove path and .deb extension to get just the package name
-        base_name = package_name.split('/')[-1]
-        if base_name.endswith('.deb'):
-            base_name = base_name[:-4]
-        
-        # Only linux-image packages affect the boot kernel
-        bootable_kernel_patterns = [
-            r'^linux-image-[0-9]',  # linux-image-6.5.0-rc1+
-            r'^linux-image-.*-azure',  # linux-image-5.15.0-1019-azure
-            r'^linux-image-.*-generic',  # linux-image-5.15.0-generic
-            r'^linux-image-.*-lowlatency',  # linux-image-5.15.0-lowlatency
-        ]
-        
-        for pattern in bootable_kernel_patterns:
-            if re.match(pattern, base_name, re.IGNORECASE):
-                self._log.info(f"Detected bootable kernel image: {base_name}")
-                return True
-        
-        return False
-
-    def _extract_kernel_version_from_package(self, package_name: str) -> str:
-        """
-        Extract kernel version from package name.
-        Example: linux-image-6.5.0-rc1+_6.5.0~rc1-12_amd64.deb -> 6.5.0-rc1+
-        Note: linux-libc-dev packages typically don't contain version info in the name
-        """
-        base_name = package_name.split('/')[-1]
-        if base_name.endswith('.deb'):
-            base_name = base_name[:-4]
-        
-        # Skip version extraction for linux-libc-dev as it doesn't follow the same naming
-        if base_name.startswith('linux-libc-dev'):
-            self._log.info(f"Skipping version extraction for libc-dev package: {package_name}")
-            return ""
-        
-        # Pattern to extract version from linux-image-VERSION
-        # Handle various formats including RC kernels
-        version_patterns = [
-            # RC kernels: linux-image-6.16.0-rc4+ -> 6.16.0-rc4+
-            r'^linux-image-([0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+[^_]*)',
-            # Standard kernels: linux-image-6.5.0-rc1+ -> 6.5.0-rc1+  
-            r'^linux-image-([0-9]+\.[0-9]+\.[0-9]+[^_]*)',
-            # Azure/distro kernels: linux-image-5.15.0-1019-azure -> 5.15.0-1019-azure
-            r'^linux-image-([0-9]+\.[0-9]+\.[0-9]+-[^_]+)',
-            # Generic fallback
-            r'^linux-image-([^_]+)',
-        ]
-        
-        for pattern in version_patterns:
-            match = re.match(pattern, base_name, re.IGNORECASE)
-            if match:
-                version = match.group(1)
-                self._log.info(f"Extracted kernel version '{version}' from package '{package_name}'")
-                return version
-        
-        self._log.warning(f"Could not extract kernel version from package: {package_name}")
-        return ""
-
     def _update_grub_for_kernel(self, kernel_version: str) -> None:
         """
         Update GRUB configuration to set the new kernel as default.
-        This mimics the behavior in other LISA kernel installers.
+        Uses LISA's built-in GRUB functionality.
         """
         try:
-            self._log.info("Updating GRUB configuration for new kernel")
+            self._log.info(f"Updating GRUB configuration for new kernel: {kernel_version}")
             
-            # Cast to Posix to access replace_boot_kernel method
+            # Use LISA's built-in GRUB functionality
             posix_os = cast(Posix, self._node.os)
             
             if kernel_version:
-                self._log.info(f"Setting kernel '{kernel_version}' as default boot option")
-                
-                # First, let's check what kernels are available in GRUB
-                cat = self._node.tools[Cat]
-                grub_result = cat.run("/boot/grub/grub.cfg", sudo=True)
-                
-                # Log available kernel entries for debugging
-                entry_pattern = re.compile(
-                    r"menuentry '.*?Linux ([^ ]*?)(?<! \(recovery mode\))' ",
-                    re.M,
-                )
-                entries = entry_pattern.findall(grub_result.stdout)
-                self._log.info(f"Available kernel entries in GRUB: {entries[:5]}")  # Show first 5
-                
-                # Check if kernels are in main menu vs submenu
-                submenu_pattern = re.compile(r"submenu '([^']*)'", re.M)
-                submenus = submenu_pattern.findall(grub_result.stdout)
-                if submenus:
-                    self._log.info(f"Found GRUB submenus: {submenus}")
-                    # Check if our kernel is in a submenu
-                    lines = grub_result.stdout.split('\n')
-                    in_submenu = None
-                    for line in lines:
-                        if 'submenu ' in line:
-                            submenu_match = submenu_pattern.search(line)
-                            if submenu_match:
-                                in_submenu = submenu_match.group(1)
-                        elif 'menuentry ' in line and kernel_version in line:
-                            if in_submenu:
-                                self._log.info(f"Kernel {kernel_version} found in submenu: '{in_submenu}'")
-                            else:
-                                self._log.info(f"Kernel {kernel_version} found in main menu")
-                            break
-                
-                # Try to update GRUB with improved error handling
+                # Set the new kernel as the default boot option
                 posix_os.replace_boot_kernel(kernel_version)
                 self._log.info("GRUB configuration updated successfully")
             else:
-                # Fallback: just run update-grub to regenerate config
-                self._log.warning("No specific kernel version provided, running update-grub")
-                result = self._node.execute("update-grub", sudo=True)
-                if result.exit_code == 0:
-                    self._log.info("GRUB configuration regenerated successfully")
-                else:
-                    self._log.error(f"Failed to update GRUB: {result.stderr}")
+                # Fallback: regenerate GRUB config without setting specific kernel
+                self._log.warning("No specific kernel version provided, regenerating GRUB config")
+                grub = self._node.os.install_grub()
+                grub.update_grub_conf()
+                self._log.info("GRUB configuration regenerated successfully")
+                
         except Exception as e:
             self._log.error(f"Failed to update GRUB for kernel '{kernel_version}': {e}")
             
             # Try a fallback approach: just regenerate GRUB config
             try:
                 self._log.info("Attempting fallback: regenerating GRUB configuration")
-                result = self._node.execute("update-grub", sudo=True)
-                if result.exit_code == 0:
-                    self._log.info("Fallback GRUB regeneration succeeded")
-                else:
-                    self._log.error(f"Fallback GRUB regeneration failed: {result.stderr}")
+                grub = self._node.os.install_grub()
+                grub.update_grub_conf()
+                self._log.info("Fallback GRUB regeneration succeeded")
             except Exception as fallback_e:
                 self._log.error(f"Fallback GRUB update also failed: {fallback_e}")
-            
-            # Don't fail the entire transformer, just log the error
-            # The reboot will still happen and may work with package's own GRUB scripts
-            self._log.warning("GRUB update failed, but continuing with transformation. "
-                            "The new kernel may still be available after reboot via package's own GRUB configuration.")
+                # Don't fail the entire transformer, just log the error
+                self._log.warning("GRUB update failed, but continuing with transformation. "
+                                "The new kernel may still be available after reboot via package's own GRUB configuration.")
